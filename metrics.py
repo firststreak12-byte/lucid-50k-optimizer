@@ -8,15 +8,9 @@ Metodología: bootstrap sampling (reordenamiento aleatorio CON reemplazo)
 de la secuencia de retornos por trade — el mismo conjunto de operaciones
 que arrojó el backtest, pero viviendo N=10,000 historias alternativas.
 
-GRANULARIDAD POR TRADE (ya no una aproximación): el input de este módulo
-es y siempre fue una lista de retornos POR TRADE. Antes se alimentaba a
-`risk_engine.update_eod_state()` tratando cada trade bootstrapeado como si
-cerrara su propio "día" — una aproximación conservadora al modelo EOD
-original. Ahora que risk_engine.py implementa trailing drawdown INTRADÍA
-real (Tradovate/Lucid), cada trade se registra vía
-`risk_engine.register_intraday_trade()`, que es exactamente la unidad de
-tiempo nativa de este simulador: ya no hay descalce entre lo que Monte
-Carlo simula y cómo se audita el riesgo en producción.
+GRANULARIDAD POR TRADE: el input de este módulo es una lista de retornos
+POR TRADE (pnl_neto). Cada trade se registra vía risk_engine.register_intraday_trade(),
+que recalcula el trailing drawdown intradía en cada simulación.
 """
 
 from __future__ import annotations
@@ -48,10 +42,10 @@ class MonteCarloAuditor:
     reordenamientos aleatorios de esa misma secuencia.
     """
 
-    def __init__(self, retornos_por_trade: List[float], config: Lucid50KConfig, fase: Fase = "evaluacion"):
-        if len(retornos_por_trade) < 10:
+    def __init__(self, retornos_por_trade: List[float], config: Lucid50KConfig, fase: Fase = "evaluacion", min_trades: int = 5):
+        if len(retornos_por_trade) < min_trades:
             raise ValueError(
-                f"Se requieren al menos 10 trades para que Monte Carlo tenga validez "
+                f"Se requieren al menos {min_trades} trades para que Monte Carlo tenga validez "
                 f"estadística; se recibieron {len(retornos_por_trade)}."
             )
         self.retornos = np.array(retornos_por_trade, dtype=float)
@@ -112,9 +106,7 @@ class MonteCarloAuditor:
 
 
 # ============================================================
-# Huérfanas de main.py (destruido) — consumidas por optimizer.py y
-# report.py. No dependen de RiskEngine ni de Lucid50KConfig: son
-# agregaciones puras sobre la lista de TradeFuturo del backtester.
+# Funciones auxiliares y de agregación consumidas por optimizer.py y report.py
 # ============================================================
 
 @dataclass
@@ -127,8 +119,7 @@ class MetricasBasicas:
 
 def calcular_metricas_basicas(trades: list) -> MetricasBasicas:
     """`trades`: lista de TradeFuturo (backtester.py). Sin trades, regresa
-    métricas en cero en vez de dividir por cero — un grid con <10 días
-    operativos ya se descarta río arriba en evaluar_combinacion()."""
+    métricas en cero en vez de dividir por cero."""
     total_trades = len(trades)
     if total_trades == 0:
         return MetricasBasicas(total_trades=0, win_rate_pct=0.0, profit_factor=0.0, ev_por_trade=0.0)
@@ -139,10 +130,7 @@ def calcular_metricas_basicas(trades: list) -> MetricasBasicas:
 
     win_rate_pct = len(ganancias) / total_trades * 100.0
     suma_perdidas = abs(sum(perdidas))
-    # Sin pérdidas: profit factor no está definido (división por cero).
-    # Se reporta como infinito en vez de 0/None para no penalizar en un
-    # sort descendente una racha perfecta — pero nunca se usa para dividir.
-    profit_factor = (sum(ganancias) / suma_perdidas) if suma_perdidas > 0 else float("inf")
+    profit_factor = (sum(ganancias) / suma_perdidas) if suma_perdidas > 0 else (float("inf") if sum(ganancias) > 0 else 0.0)
     ev_por_trade = sum(pnls) / total_trades
 
     return MetricasBasicas(
@@ -153,14 +141,17 @@ def calcular_metricas_basicas(trades: list) -> MetricasBasicas:
     )
 
 
+def obtener_retornos_por_trade(trades: list) -> list[float]:
+    """Extrae la lista directa de pnl_neto por trade para MonteCarloAuditor."""
+    return [t.pnl_neto for t in trades]
+
+
 def _agregar_pnl_por_dia(trades: list) -> list:
     """`trades`: lista de TradeFuturo. Agrupa pnl_neto por fecha_operativa
-    y regresa la serie diaria EN ORDEN CRONOLÓGICO — es el input esperado
-    por MonteCarloAuditor (que ya trabaja a granularidad de trade/día
-    indistintamente) y por RejillaParametros.evaluar_combinacion() para el
-    filtro de "mínimo 10 días operativos"."""
+    y regresa la serie diaria EN ORDEN CRONOLÓGICO."""
     pnl_por_dia: Dict[object, float] = {}
     for t in trades:
         pnl_por_dia[t.fecha_operativa] = pnl_por_dia.get(t.fecha_operativa, 0.0) + t.pnl_neto
 
     return [pnl_por_dia[fecha] for fecha in sorted(pnl_por_dia.keys())]
+  
