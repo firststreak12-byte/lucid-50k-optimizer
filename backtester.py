@@ -105,7 +105,7 @@ def ejecutar_backtest_futuros(
     equity_running = risk_engine.config.capital_inicial
     daily_profits_history: List[float] = []
     pnl_dia_actual = 0.0
-    fecha_dia_actual = df.iloc[0]["fecha_operativa"] if len(df) else None
+    fecha_dia_actual = df.iloc[0]["fecha_operativa"] if len(df) > 0 else None
 
     en_posicion = False
     direccion_actual: Optional[str] = None
@@ -118,16 +118,15 @@ def ejecutar_backtest_futuros(
     for i in range(1, len(df)):
         fila = df.iloc[i]
 
-        # --- Corte de día: snapshot diario (consistencia/logging) + red de
-        # seguridad. La ruina YA se detecta trade a trade (ver bloque de
-        # cierre de posición más abajo, vía register_intraday_trade); este
-        # chequeo aquí solo cubriría un caso degenerado (equity sin
-        # trades entre cortes) y en la práctica es un no-op idempotente. ---
+        # --- Corte de día: snapshot diario + reset de circuit breaker ---
         if fila["fecha_operativa"] != fecha_dia_actual:
             risk_engine.update_eod_state(equity_running)
             daily_profits_history.append(pnl_dia_actual)
             pnl_dia_actual = 0.0
             fecha_dia_actual = fila["fecha_operativa"]
+            
+            # REINICIALIZAR CIRCUIT BREAKER TÁCTICO PARA EL NUEVO DÍA OPERATIVO
+            risk_engine.circuit_breaker_activo = False
 
             if risk_engine.cuenta_quemada():
                 resultado.cuenta_rota = True
@@ -147,14 +146,22 @@ def ejecutar_backtest_futuros(
 
             if direccion_actual == "BUY":
                 if fila["low"] <= sl_actual:
-                    salida_precio, motivo = sl_actual, "Stop Loss"
+                    # Soporte para gaps bajistas: si el open rompe el SL, llena en open
+                    salida_precio = min(fila["open"], sl_actual) if fila["open"] < sl_actual else sl_actual
+                    motivo = "Stop Loss"
                 elif fila["high"] >= tp_actual:
-                    salida_precio, motivo = tp_actual, "Take Profit"
+                    # Soporte para gaps alcistas: si el open supera el TP, llena en open
+                    salida_precio = max(fila["open"], tp_actual) if fila["open"] > tp_actual else tp_actual
+                    motivo = "Take Profit"
             else:  # SELL
                 if fila["high"] >= sl_actual:
-                    salida_precio, motivo = sl_actual, "Stop Loss"
+                    # Soporte para gaps alcistas en cortos: llena en el mayor precio entre open y SL
+                    salida_precio = max(fila["open"], sl_actual) if fila["open"] > sl_actual else sl_actual
+                    motivo = "Stop Loss"
                 elif fila["low"] <= tp_actual:
-                    salida_precio, motivo = tp_actual, "Take Profit"
+                    # Soporte para gaps bajistas en cortos: llena en el menor precio entre open y TP
+                    salida_precio = min(fila["open"], tp_actual) if fila["open"] < tp_actual else tp_actual
+                    motivo = "Take Profit"
 
             if salida_precio is not None:
                 slip = _costo_slippage_en_precio(contrato, slippage_ticks)
@@ -192,12 +199,7 @@ def ejecutar_backtest_futuros(
                 en_posicion = False
                 direccion_actual = None
 
-                # --- Trailing drawdown INTRADÍA: se recalcula el Peak
-                # Balance y el piso AQUÍ, en el cierre de este trade —
-                # exactamente como lo hace Tradovate en producción — en
-                # vez de esperar al corte de día. Si esto revienta el
-                # piso, la cuenta se considera quemada en el instante
-                # mismo del trade, no horas después al cierre del día.
+                # Trailing drawdown INTRADÍA
                 risk_engine.register_intraday_trade(equity_running)
                 if risk_engine.cuenta_quemada():
                     resultado.cuenta_rota = True
@@ -205,14 +207,16 @@ def ejecutar_backtest_futuros(
                     break
 
                 # Regla de consistencia: si el día ya es demasiado dominante,
-                # se bloquean nuevas entradas por el resto del día (fase funded).
+                # se bloquean nuevas entradas sólo por lo que resta de este día.
                 if not risk_engine.check_consistency_rule(daily_profits_history, pnl_dia_actual):
                     risk_engine.circuit_breaker_activo = True  # bloqueo táctico del día en curso
 
         # --- Búsqueda de nueva entrada ---
         if not en_posicion:
-            accion = acciones_ejecutables.iloc[i]
-            if accion in (Accion.BUY.value, Accion.SELL.value):
+            accion_val = acciones_ejecutables.iloc[i]
+            accion_str = accion_val.value if hasattr(accion_val, 'value') else str(accion_val) if accion_val is not None else ""
+
+            if accion_str in (Accion.BUY.value, Accion.SELL.value):
                 mini_qty = cantidad_contratos if tipo_contrato == "mini" else 0
                 micro_qty = cantidad_contratos if tipo_contrato == "micro" else 0
 
@@ -224,11 +228,16 @@ def ejecutar_backtest_futuros(
                 else:
                     slip = _costo_slippage_en_precio(contrato, slippage_ticks)
                     precio_entrada_puro = fila["open"]
-                    precio_entrada_ejecutado = fila["open"] + slip if accion == Accion.BUY.value else fila["open"] - slip
-                    direccion_actual = accion
+                    precio_entrada_ejecutado = fila["open"] + slip if accion_str == Accion.BUY.value else fila["open"] - slip
+                    direccion_actual = accion_str
                     sl_actual = sl_ejecutables.iloc[i]
                     tp_actual = tp_ejecutables.iloc[i]
                     idx_entrada = i
                     en_posicion = True
+
+    # Registrar el último día al finalizar el recorrido si la cuenta está activa
+    if len(df) > 0 and not resultado.cuenta_rota and not resultado.profit_target_alcanzado:
+        risk_engine.update_eod_state(equity_running)
+        daily_profits_history.append(pnl_dia_actual)
 
     return resultado
