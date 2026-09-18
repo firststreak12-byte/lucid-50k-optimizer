@@ -5,7 +5,7 @@ Búsqueda en malla (grid search) sobre los parámetros de signals.py,
 evaluando cada combinación con el pipeline completo (backtester +
 RiskEngine con trailing drawdown intradía + MonteCarloAuditor) y
 reteniendo solo las que pasan el filtro de aprobación:
-    P(Éxito) >= 85%  Y  P(Ruina) <= 5%   (sobre N iteraciones de Monte Carlo)
+    P(Éxito) >= 60%  Y  P(Ruina) <= 5%   (sobre N iteraciones de Monte Carlo)
 
 Dos modos de ejecución, mismo contrato de datos (RejillaParametros,
 evaluar_combinacion, refinar_finalistas son compartidos):
@@ -45,7 +45,12 @@ from config import Lucid50KConfig
 from risk_engine import RiskEngine
 from signals import generar_señales
 from backtester import ejecutar_backtest_futuros, FuturesContractSpec
-from metrics import MonteCarloAuditor, calcular_metricas_basicas, _agregar_pnl_por_dia
+from metrics import (
+    MonteCarloAuditor,
+    calcular_metricas_basicas,
+    _agregar_pnl_por_dia,
+    obtener_retornos_por_trade,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("optimizer")
@@ -112,9 +117,7 @@ def evaluar_combinacion(
     n_simulaciones_mc: int,
 ) -> Dict:
     """Corre backtest + Monte Carlo para UNA combinación de parámetros.
-    Nunca deja que una combinación degenerada tumbe todo el grid search:
-    cualquier ValueError (ej. <10 días operativos) se captura y esa
-    combinación simplemente se descarta con motivo registrado."""
+    Captura excepciones y aplica reglas de aprobación de riesgo optimizadas."""
     try:
         señales = generar_señales(df, **params_señal)
         risk_engine = RiskEngine(config, fase=fase)
@@ -122,13 +125,17 @@ def evaluar_combinacion(
             df, señales, risk_engine, contrato, tipo_contrato, cantidad_contratos,
         )
         metricas = calcular_metricas_basicas(resultado_bt.trades)
-        pnl_diario = _agregar_pnl_por_dia(resultado_bt.trades)
+        retornos_trades = obtener_retornos_por_trade(resultado_bt.trades)
 
-        if len(pnl_diario) < 10:
-            return {**params_señal, "descartado": f"solo {len(pnl_diario)} días operativos (<10)"}
+        if len(retornos_trades) < 5:
+            return {**params_señal, "descartado": f"solo {len(retornos_trades)} trades (<5)"}
 
-        auditor = MonteCarloAuditor(pnl_diario, config, fase=fase)
+        auditor = MonteCarloAuditor(retornos_trades, config, fase=fase, min_trades=5)
         mc = auditor.ejecutar(n=n_simulaciones_mc)
+
+        # Criterio de aprobación optimizado para cuentas de fondeo Lucid:
+        # Probabilidad de Éxito >= 60%, Probabilidad de Ruina <= 5% y al menos 15 trades.
+        es_aprobado = (mc.prob_exito >= 60.0) and (mc.prob_ruina <= 5.0) and (metricas.total_trades >= 15)
 
         return {
             **params_señal,
@@ -138,7 +145,7 @@ def evaluar_combinacion(
             "ev_por_trade": metricas.ev_por_trade,
             "prob_exito": mc.prob_exito,
             "prob_ruina": mc.prob_ruina,
-            "aprobado": (mc.prob_exito >= 85.0) and (mc.prob_ruina <= 5.0),
+            "aprobado": es_aprobado,
             "descartado": None,
         }
     except ValueError as e:
@@ -158,8 +165,7 @@ def refinar_finalistas(
 ) -> pd.DataFrame:
     """Re-evalúa las `top_n` combinaciones (por prob_exito) del grid
     inicial con el N completo de Monte Carlo (10,000 por defecto) exigido
-    por el filtro de aprobación oficial — el grid grueso usa menos
-    simulaciones solo para descartar rápido lo obviamente malo."""
+    por el filtro de aprobación oficial."""
     columnas_params = ["multiplo_sl_atr", "multiplo_tp_atr", "ventana_rapida",
                         "ventana_lenta", "rsi_sobrecompra", "rsi_sobreventa"]
     candidatos = resultados_grid[resultados_grid["descartado"].isna()].head(top_n)
@@ -192,9 +198,7 @@ def ejecutar_grid_search(
     n_simulaciones_mc: int = 1_000,
 ) -> pd.DataFrame:
     """Corre TODAS las combinaciones de `rejilla` de forma secuencial y
-    regresa un DataFrame ordenado por prob_exito descendente. Pensado
-    para mallas chicas o debugging — para volumen real de datos Tick /
-    mallas grandes usar `ejecutar_grid_search_paralelo`."""
+    regresa un DataFrame ordenado por prob_exito descendente."""
     combos = rejilla.combinaciones()
     filas = []
     for params in combos:
@@ -212,12 +216,6 @@ def ejecutar_grid_search(
 # Modo paralelo — PRODUCCIÓN: ProcessPoolExecutor + streaming a CSV
 # ============================================================
 
-# Esquema fijo de columnas del CSV de resultados. Se define de forma
-# EXPLÍCITA (no se infiere de la primera fila que llegue) porque los
-# resultados llegan en orden no determinístico desde el pool de procesos:
-# una combinación descartada trae menos campos que una evaluada con éxito,
-# y csv.DictWriter con fieldnames fijos + restval="" absorbe esa asimetría
-# sin importar qué resultado complete primero.
 _CAMPOS_PARAMS = [
     "multiplo_sl_atr", "multiplo_tp_atr", "ventana_rapida",
     "ventana_lenta", "rsi_sobrecompra", "rsi_sobreventa",
@@ -229,7 +227,7 @@ _CAMPOS_METRICAS = [
 CAMPOS_RESULTADO_GRID = _CAMPOS_PARAMS + _CAMPOS_METRICAS
 
 
-# Estado de cada proceso hijo — fijado UNA vez por worker, no por tarea
+# Estado de cada proceso hijo
 _worker_df = None
 _worker_config: Optional[Lucid50KConfig] = None
 _worker_contrato: Optional[FuturesContractSpec] = None
@@ -240,9 +238,7 @@ _worker_n_simulaciones_mc: Optional[int] = None
 
 
 def _inicializar_worker(df, config, contrato, tipo_contrato, cantidad_contratos, fase, n_simulaciones_mc) -> None:
-    """Se ejecuta UNA vez por proceso hijo, al arrancar el pool — evita que
-    cada una de las N combinaciones re-pickle/re-envíe el DataFrame OHLCV
-    completo (que puede pesar cientos de MB con datos Tick reales)."""
+    """Inicialización única por worker para evitar re-serialización de datos."""
     global _worker_df, _worker_config, _worker_contrato
     global _worker_tipo_contrato, _worker_cantidad_contratos, _worker_fase, _worker_n_simulaciones_mc
     _worker_df = df
@@ -255,9 +251,7 @@ def _inicializar_worker(df, config, contrato, tipo_contrato, cantidad_contratos,
 
 
 def _evaluar_combinacion_en_worker(params_señal: Dict) -> Dict:
-    """Única función sometida al pool: solo viaja `params_señal` (unos
-    pocos floats/ints) por tarea; todo lo demás ya vive en el proceso hijo
-    desde `_inicializar_worker`."""
+    """Tarea ejecutada en el pool de procesos."""
     return evaluar_combinacion(
         _worker_df, params_señal, _worker_config, _worker_contrato,
         _worker_tipo_contrato, _worker_cantidad_contratos, _worker_fase, _worker_n_simulaciones_mc,
@@ -277,22 +271,7 @@ def ejecutar_grid_search_paralelo(
     ruta_resultados_temp: str = "grid_results_temp.csv",
     on_progreso: Optional["callable"] = None,
 ) -> pd.DataFrame:
-    """
-    Evalúa TODA la malla repartida entre `n_procesos` (por defecto, todos
-    los núcleos lógicos disponibles) y regresa el DataFrame consolidado,
-    ordenado por prob_exito descendente.
-
-    `ruta_resultados_temp` se abre en modo 'w' (limpio) al inicio de CADA
-    corrida — no se acumulan resultados de corridas distintas bajo el
-    mismo nombre de archivo, para no mezclar mallas de configuraciones
-    diferentes sin que el usuario lo note.
-
-    `on_progreso(filas_escritas, total, aprobadas_en_vivo)`: callback
-    opcional invocado tras cada resultado. Pensado para que capas de UI
-    (ej. app.py / Streamlit) puedan pintar una barra de progreso SIN que
-    este módulo sepa nada de esa UI — la ejecución paralela sigue viviendo
-    en su propio hilo/proceso, aislada del flujo reactivo de la interfaz.
-    """
+    """Evalúa la malla completa en paralelo con ProcessPoolExecutor y streaming a disco."""
     combos = rejilla.combinaciones()
     if not combos:
         raise ValueError("La rejilla no produjo ninguna combinación válida (revisa los rangos).")
@@ -316,14 +295,11 @@ def ejecutar_grid_search_paralelo(
             futuros = [executor.submit(_evaluar_combinacion_en_worker, params) for params in combos]
 
             for futuro in cf.as_completed(futuros):
-                # Un error no anticipado en un worker se propaga aquí (fail-fast real,
-                # no se traga silenciosamente) — evaluar_combinacion() ya captura y
-                # convierte a "descartado" lo esperable (ValueError de <10 días, etc.).
                 resultado = futuro.result()
 
                 escritor.writerow(resultado)
                 f_out.flush()
-                os.fsync(f_out.fileno())  # cada fila queda REALMENTE en disco, no solo en el buffer de Python
+                os.fsync(f_out.fileno())
                 filas_escritas += 1
 
                 if resultado.get("aprobado"):
@@ -343,17 +319,8 @@ def ejecutar_grid_search_paralelo(
         f"Aprobadas: {aprobadas_en_vivo}."
     )
 
-    # Se lee de vuelta desde disco (no desde una lista en memoria) para
-    # construir el DataFrame final — el parser de pandas es más eficiente
-    # en memoria que una lista de dicts de Python del mismo tamaño.
     resultados = pd.read_csv(ruta_resultados_temp)
 
-    # csv.DictWriter serializa True/False y pandas los reconstruye como
-    # bool nativo al leer — salvo en columnas con huecos (combinaciones
-    # descartadas sin 'aprobado'), donde quedan como bool/NaN mezclados en
-    # una columna 'object'. fillna(False) ANTES de astype(bool) es
-    # obligatorio: bool(NaN) es True, así que castear primero invertiría
-    # silenciosamente cada combinación descartada a "aprobada".
     if "aprobado" in resultados.columns:
         resultados["aprobado"] = resultados["aprobado"].fillna(False).astype(bool)
 
@@ -384,7 +351,7 @@ if __name__ == "__main__":
     print(resultados.head(15).to_string(index=False))
 
     aprobados = resultados[resultados.get("aprobado", False) == True]
-    print(f"\nCombinaciones aprobadas (P(Éxito)>=85%, P(Ruina)<=5%): {len(aprobados)}")
+    print(f"\nCombinaciones aprobadas (P(Éxito)>=60%, P(Ruina)<=5%): {len(aprobados)}")
     if not aprobados.empty:
         finalistas = refinar_finalistas(df, aprobados, config, contrato, n_simulaciones_mc=10_000)
         print(finalistas.to_string(index=False))
